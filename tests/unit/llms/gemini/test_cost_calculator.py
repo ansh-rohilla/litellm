@@ -313,3 +313,33 @@ def test_flash_latest_alias_spellings_price_identically(monkeypatch, prefixed, b
         "cache_read_input_token_cost",
     ):
         assert prefixed_entry[cost_key] == bare_entry[cost_key]
+
+
+def test_gemini_robotics_er_2_preview_reasoning_cost(monkeypatch):
+    """Reasoning tokens for gemini-robotics-er-2-preview should be billed at current output rate ($5/1M)."""
+    monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+    monkeypatch.setattr(litellm, "model_cost", litellm.get_model_cost_map(url=""))
+
+    from litellm.litellm_core_utils.llm_cost_calc.utils import generic_cost_per_token
+    from litellm.types.utils import CompletionTokensDetailsWrapper
+
+    entry = litellm.model_cost["gemini/gemini-robotics-er-2-preview"]
+    assert entry["output_cost_per_token"] == 5e-06
+    assert entry["output_cost_per_reasoning_token"] == 5e-06
+
+    usage = Usage(
+        prompt_tokens=0,
+        completion_tokens=1000,
+        total_tokens=1000,
+        completion_tokens_details=CompletionTokensDetailsWrapper(
+            reasoning_tokens=1000,
+            text_tokens=0,
+        ),
+    )
+    _, cost = generic_cost_per_token(
+        model="gemini/gemini-robotics-er-2-preview",
+        usage=usage,
+        custom_llm_provider="gemini",
+    )
+    assert cost == pytest.approx(5e-06 * 1000)
+
