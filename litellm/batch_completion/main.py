@@ -1,4 +1,4 @@
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Final
 
 import litellm
@@ -146,56 +146,62 @@ def batch_completion_models(*args, **kwargs):
     if "model" in kwargs:
         kwargs.pop("model")
     if "models" in kwargs:
-        models: Final = kwargs["models"]
-        kwargs.pop("models")
-        futures = {}
-        with ThreadPoolExecutor(max_workers=len(models)) as executor:
-            for model in models:
-                futures[model] = executor.submit(litellm.completion, *args, model=model, **kwargs)
+        models: Final = kwargs.pop("models")
+        if isinstance(models, str):
+            models_list = [models]
+        elif isinstance(models, (list, tuple)):
+            models_list = list(models)
+        else:
+            raise TypeError("'models' must be a string or list of strings")
 
-            for model, future in sorted(futures.items(), key=lambda x: models.index(x[0])):
-                if future.result() is not None:
-                    return future.result()
-    elif "deployments" in kwargs:
-        deployments: Final = kwargs["deployments"]
-        kwargs.pop("deployments")
-        kwargs.pop("model_list")
-        nested_kwargs: Final = kwargs.pop("kwargs", {})
-        futures = {}
-        with ThreadPoolExecutor(max_workers=len(deployments)) as executor:
-            for deployment in deployments:
-                for key in kwargs:
-                    if key not in deployment:  # don't override deployment values e.g. model name, api base, etc.
-                        deployment[key] = kwargs[key]
-                kwargs = {**deployment, **nested_kwargs}
-                futures[deployment["model"]] = executor.submit(litellm.completion, **kwargs)
+        if not models_list:
+            return None
 
-            while futures:
-                # wait for the first returned future
-                print_verbose("\n\n waiting for next result\n\n")
-                done, _ = wait(futures.values(), return_when=FIRST_COMPLETED)
-                print_verbose(f"done list\n{done}")
-                for future in done:
-                    try:
-                        result = future.result()
+        executor = ThreadPoolExecutor(max_workers=len(models_list))
+        try:
+            futures = [executor.submit(litellm.completion, *args, model=model, **kwargs) for model in models_list]
+            for future in as_completed(futures):
+                try:
+                    result = future.result()
+                    if result is not None:
                         return result
-                    except Exception:
-                        # if model 1 fails, continue with response from model 2, model3
-                        print_verbose("\n\ngot an exception, ignoring, removing from futures")
-                        print_verbose(futures)
-                        new_futures = {}
-                        for key, value in futures.items():
-                            if future == value:
-                                print_verbose(f"removing key{key}")
-                                continue
-                            else:
-                                new_futures[key] = value
-                        futures = new_futures
-                        print_verbose(f"new futures{futures}")
-                        continue
+                except Exception as e:
+                    print_verbose(f"batch_completion_models: model request failed: {e}")
+                    continue
+        finally:
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                executor.shutdown(wait=False)
+    elif "deployments" in kwargs:
+        deployments: Final = kwargs.pop("deployments")
+        kwargs.pop("model_list", None)
+        nested_kwargs: Final = kwargs.pop("kwargs", {})
+        if not deployments:
+            return None
 
-                print_verbose("\n\ndone looping through futures\n\n")
-                print_verbose(futures)
+        executor = ThreadPoolExecutor(max_workers=len(deployments))
+        try:
+            futures = []
+            for deployment in deployments:
+                call_kwargs = kwargs.copy()
+                call_kwargs.update(deployment)
+                call_kwargs.update(nested_kwargs)
+                futures.append(executor.submit(litellm.completion, **call_kwargs))
+
+            for future in as_completed(futures):
+                try:
+                    result = future.result()
+                    if result is not None:
+                        return result
+                except Exception as e:
+                    print_verbose(f"batch_completion_models: deployment request failed: {e}")
+                    continue
+        finally:
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                executor.shutdown(wait=False)
 
     return None  # If no response is received from any model
 
