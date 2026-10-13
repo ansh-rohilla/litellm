@@ -4833,6 +4833,162 @@ def test_assembled_stream_uses_later_provider_model_for_cost(
     )
 
 
+def test_openrouter_streaming_served_model_preserved_on_chunks_and_assembled(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from litellm.router_utils.add_retry_fallback_headers import (
+        get_hidden_params_dict,
+    )
+
+    served_model = "deepseek/deepseek-v4.1-flash"
+    served_model_info = {
+        "input_cost_per_token": 0.000001,
+        "output_cost_per_token": 0.000002,
+        "litellm_provider": "openrouter",
+    }
+    monkeypatch.setitem(
+        litellm.model_cost,
+        f"openrouter/{served_model}",
+        served_model_info,
+    )
+
+    logging_obj = MagicMock()
+    logging_obj.model_call_details = {
+        "custom_llm_provider": "openrouter",
+        "model": "openrouter/auto",
+    }
+    wrapper = CustomStreamWrapper(
+        completion_stream=None,
+        model="openrouter/auto",
+        logging_obj=logging_obj,
+        custom_llm_provider="openrouter",
+    )
+    first_chunk = ModelResponseStream(
+        id="chunk-1",
+        model=served_model,
+        choices=[
+            StreamingChoices(
+                finish_reason=None,
+                index=0,
+                delta=Delta(content="Hello"),
+            )
+        ],
+    )
+    second_chunk = ModelResponseStream(
+        id="chunk-1",
+        model=served_model,
+        choices=[
+            StreamingChoices(
+                finish_reason=None,
+                index=0,
+                delta=Delta(content=" world"),
+            )
+        ],
+    )
+    terminal_chunk = ModelResponseStream(
+        id="chunk-1",
+        model=served_model,
+        choices=[
+            StreamingChoices(
+                finish_reason="stop",
+                index=0,
+                delta=Delta(),
+            )
+        ],
+    )
+
+    first_result = wrapper.chunk_creator(chunk=first_chunk)
+    second_result = wrapper.chunk_creator(chunk=second_chunk)
+    terminal_result = wrapper.chunk_creator(chunk=terminal_chunk)
+
+    assert first_result is not None
+    assert second_result is not None
+    assert terminal_result is not None
+
+    # Stream chunks must carry the served model
+    assert first_result.model == served_model
+    assert second_result.model == served_model
+    assert terminal_result.model == served_model
+
+    assert (
+        get_hidden_params_dict(first_result)["provider_response_model"]
+        == served_model
+    )
+    assert (
+        get_hidden_params_dict(second_result)["provider_response_model"]
+        == served_model
+    )
+
+    # Requested router alias remains available in logging / routing metadata
+    assert logging_obj.model_call_details["model"] == "openrouter/auto"
+
+    # Assembled response carries the served model and accurately prices against it
+    assembled = litellm.stream_chunk_builder(
+        chunks=[first_result, second_result, terminal_result]
+    )
+    assert assembled is not None
+    assert assembled.model == served_model
+    assert (
+        get_hidden_params_dict(assembled)["provider_response_model"]
+        == served_model
+    )
+
+    assembled.usage = Usage(prompt_tokens=10, completion_tokens=5, total_tokens=15)
+    cost = litellm.completion_cost(
+        completion_response=assembled,
+        custom_llm_provider="openrouter",
+    )
+    assert cost == pytest.approx(
+        10 * served_model_info["input_cost_per_token"]
+        + 5 * served_model_info["output_cost_per_token"]
+    )
+
+
+def test_openrouter_streaming_empty_model_does_not_overwrite():
+    logging_obj = MagicMock()
+    logging_obj.model_call_details = {
+        "custom_llm_provider": "openrouter",
+        "model": "openrouter/auto",
+    }
+    wrapper = CustomStreamWrapper(
+        completion_stream=None,
+        model="openrouter/auto",
+        logging_obj=logging_obj,
+        custom_llm_provider="openrouter",
+    )
+    first_chunk = ModelResponseStream(
+        id="chunk-1",
+        model="deepseek/deepseek-v4.1-flash",
+        choices=[
+            StreamingChoices(
+                finish_reason=None,
+                index=0,
+                delta=Delta(content="Hello"),
+            )
+        ],
+    )
+    empty_model_chunk = ModelResponseStream(
+        id="chunk-1",
+        model=None,
+        choices=[
+            StreamingChoices(
+                finish_reason="stop",
+                index=0,
+                delta=Delta(),
+            )
+        ],
+    )
+
+    first_result = wrapper.chunk_creator(chunk=first_chunk)
+    empty_result = wrapper.chunk_creator(chunk=empty_model_chunk)
+
+    assert first_result is not None
+    assert empty_result is not None
+    # Subsequent chunk with empty/None model retains the previously served model
+    assert first_result.model == "deepseek/deepseek-v4.1-flash"
+    assert empty_result.model == "deepseek/deepseek-v4.1-flash"
+
+
 @pytest.mark.asyncio
 async def test_async_stream_assembled_response_keeps_vertex_traffic_type(logging_obj: Logging):
     content_chunk = ModelResponseStream(
